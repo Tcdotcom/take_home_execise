@@ -1,0 +1,274 @@
+# =============================================================================
+# Golden-Path CI/CD Pipeline
+# =============================================================================
+# This workflow implements a full build-test-scan-deploy pipeline for the
+# golden-path demo service. It uses GitHub Actions' reusable workflow pattern
+# so that individual teams can call this from their own repos.
+#
+# Key design decisions:
+#   - OIDC federation for AWS (no long-lived secrets)
+#   - Trivy for container vulnerability scanning
+#   - Helm-based deployment to EKS
+#   - Dev deploys automatically; staging/prod require manual approval
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:                         # Allow other repos to call this pipeline
+    inputs:
+      environment:
+        description: "Target environment (dev, staging, prod)"
+        required: false
+        type: string
+        default: "dev"
+
+# Limit concurrent runs per branch to avoid race conditions on deploy.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Top-level permissions — least privilege.
+permissions:
+  contents: read
+  id-token: write          # Required for OIDC federation with AWS
+  security-events: write   # Required for uploading Trivy SARIF results
+
+env:
+  GO_VERSION: "1.22"
+  AWS_REGION: "eu-central-1"
+  ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-central-1.amazonaws.com"
+  ECR_REPOSITORY: "golden-path-demo"
+  HELM_CHART_PATH: "infra/helm/golden-path"
+  EKS_CLUSTER_NAME: "golden-path-cluster"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Lint — Static analysis with golangci-lint
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: app/go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: v1.57
+          working-directory: app
+          args: --timeout=5m
+
+  # ---------------------------------------------------------------------------
+  # 2. Test — Unit tests with race detection and coverage
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: app/go.sum
+
+      - name: Run tests
+        working-directory: app
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: app/coverage.out
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 3. Build — Docker image build, Trivy scan, push to ECR
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS via OIDC — no long-lived credentials.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Generate a deterministic, traceable image tag from the Git SHA.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scan the image for CVEs before it reaches any cluster.
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"       # Fail the build on CRITICAL/HIGH findings
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # ---------------------------------------------------------------------------
+  # 4. Deploy to Dev — automatic on main merge
+  # ---------------------------------------------------------------------------
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build]
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }}-dev \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install golden-path-demo \
+            ${{ env.HELM_CHART_PATH }} \
+            -f ${{ env.HELM_CHART_PATH }}/values.yaml \
+            -f ${{ env.HELM_CHART_PATH }}/values-dev.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace golden-path \
+            --create-namespace \
+            --wait --timeout 5m
+
+  # ---------------------------------------------------------------------------
+  # 5. Deploy to Staging — requires manual approval
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    environment:
+      name: staging                      # GitHub Environment with required reviewers
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }}-staging \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install golden-path-demo \
+            ${{ env.HELM_CHART_PATH }} \
+            -f ${{ env.HELM_CHART_PATH }}/values.yaml \
+            -f ${{ env.HELM_CHART_PATH }}/values-staging.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace golden-path \
+            --create-namespace \
+            --wait --timeout 5m
+
+  # ---------------------------------------------------------------------------
+  # 6. Deploy to Production — requires manual approval
+  # ---------------------------------------------------------------------------
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    environment:
+      name: production                   # GitHub Environment with required reviewers
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }}-prod \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install golden-path-demo \
+            ${{ env.HELM_CHART_PATH }} \
+            -f ${{ env.HELM_CHART_PATH }}/values.yaml \
+            -f ${{ env.HELM_CHART_PATH }}/values-prod.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --namespace golden-path \
+            --create-namespace \
+            --wait --timeout 10m

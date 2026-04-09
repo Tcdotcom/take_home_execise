@@ -1,0 +1,20 @@
+apiVersion: v2
+name: golden-path
+description: Golden-path Helm chart for deploying applications on AWS EKS
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+maintainers:
+  - name: Platform Engineering
+    email: platform@maltego.com
+
+keywords:
+  - golden-path
+  - eks
+  - aws
+  - microservice
+
+home: https://github.com/maltego/golden-path-platform
+sources:
+  - https://github.com/maltego/golden-path-platform

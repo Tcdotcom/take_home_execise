@@ -1,0 +1,91 @@
+# =============================================================================
+# Production Environment Overrides
+# =============================================================================
+# High availability: 3+ replicas, strict resource limits, WAF enabled,
+# aggressive HPA, pod disruption budget implied via anti-affinity.
+# =============================================================================
+
+replicaCount: 3
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+env:
+  - name: LOG_LEVEL
+    value: warn
+  - name: ENVIRONMENT
+    value: prod
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 75
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600    # Slow scale-down to avoid flapping
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 6
+          periodSeconds: 30
+      selectPolicy: Max
+
+ingress:
+  hosts:
+    - host: app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # WAF enabled in production — protects against OWASP Top 10, rate limiting.
+  wafAclArn: arn:aws:wafv2:eu-central-1:ACCOUNT_ID:regional/webacl/golden-path-prod-waf/WEBACL_ID
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/shield-advanced-protection: "true"
+
+externalSecret:
+  remoteRef:
+    key: golden-path/prod
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: golden-path/prod
+        property: database_url
+    - secretKey: API_KEY
+      remoteRef:
+        key: golden-path/prod
+        property: api_key
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/golden-path-prod-app
+
+serviceMonitor:
+  interval: 15s            # More frequent scraping in prod for faster alerting
+
+# Spread pods across AZs for high availability.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: golden-path-demo

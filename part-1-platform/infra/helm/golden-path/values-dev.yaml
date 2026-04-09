@@ -1,0 +1,49 @@
+# =============================================================================
+# Dev Environment Overrides
+# =============================================================================
+# Optimised for fast iteration and low cost: single replica, debug logging,
+# relaxed resource limits, WAF disabled.
+# =============================================================================
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+env:
+  - name: LOG_LEVEL
+    value: debug
+  - name: ENVIRONMENT
+    value: dev
+
+autoscaling:
+  enabled: false
+
+ingress:
+  hosts:
+    - host: app.dev.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  wafAclArn: ""           # WAF disabled in dev
+
+externalSecret:
+  remoteRef:
+    key: golden-path/dev
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: golden-path/dev
+        property: database_url
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/golden-path-dev-app
+
+serviceMonitor:
+  interval: 60s           # Less frequent scraping in dev

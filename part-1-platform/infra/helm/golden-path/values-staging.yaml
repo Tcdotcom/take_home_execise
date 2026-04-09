@@ -1,0 +1,52 @@
+# =============================================================================
+# Staging Environment Overrides
+# =============================================================================
+# Mirrors production topology (2 replicas, HPA enabled) but with slightly
+# relaxed resources. WAF enabled to test rules before prod rollout.
+# =============================================================================
+
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+env:
+  - name: LOG_LEVEL
+    value: info
+  - name: ENVIRONMENT
+    value: staging
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+ingress:
+  hosts:
+    - host: app.staging.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  wafAclArn: arn:aws:wafv2:eu-central-1:ACCOUNT_ID:regional/webacl/golden-path-staging-waf/WEBACL_ID
+
+externalSecret:
+  remoteRef:
+    key: golden-path/staging
+  data:
+    - secretKey: DATABASE_URL
+      remoteRef:
+        key: golden-path/staging
+        property: database_url
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/golden-path-staging-app
+
+serviceMonitor:
+  interval: 30s
